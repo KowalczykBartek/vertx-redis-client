@@ -26,7 +26,10 @@ import io.vertx.redis.client.*;
 import io.vertx.redis.client.impl.types.ErrorType;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Queue;
+import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -94,9 +97,13 @@ public class RedisClient implements Redis, ParserHandler {
   // connection is operational.
   private boolean connected = false;
 
+  private boolean initialized = false;
+  private Queue<Runnable> queuedTasks;
+
   private RedisClient(Vertx vertx, RedisOptions options, SocketAddress endpoint) {
     this.netClient = vertx.createNetClient(options.getNetClientOptions());
     this.waiting = new ArrayQueue(options.getMaxWaitingHandlers());
+    this.queuedTasks = new LinkedBlockingDeque<>(1000);
     this.socketAddress = endpoint;
     this.options = options;
   }
@@ -160,10 +167,19 @@ public class RedisClient implements Redis, ParserHandler {
             onConnect.handle(Future.failedFuture(select.cause()));
             return;
           }
-
           // initialization complete
           this.connected = true;
           onConnect.handle(Future.succeededFuture(this));
+
+          //release all pending requests that could not be sent before.
+          initialized = true;
+          final Iterator<Runnable> iterator = queuedTasks.iterator();
+          while(iterator.hasNext()){
+            final Runnable next = iterator.next();
+            next.run();
+            iterator.remove();
+          }
+          queuedTasks = null; //let gc remove it.
         });
       });
     });
@@ -232,6 +248,15 @@ public class RedisClient implements Redis, ParserHandler {
 
   @Override
   public Redis send(final Request request, Handler<AsyncResult<Response>> handler) {
+
+    if(!initialized) {
+      final boolean offer = queuedTasks.offer(() -> send(request, handler));
+      if(!offer) {
+        handler.handle(Future.failedFuture("Redis pending requests queue is full"));
+      }
+      return this;
+    }
+
     if (!connected) {
       // this avoids entering the socket exception handler as it is well known
       // that the transport is broken.
@@ -257,6 +282,22 @@ public class RedisClient implements Redis, ParserHandler {
 
   @Override
   public Redis batch(List<Request> commands, Handler<AsyncResult<List<Response>>> handler) {
+
+    if(!initialized) {
+      final boolean offer = queuedTasks.offer(() -> batch(commands, handler));
+      if(!offer) {
+        handler.handle(Future.failedFuture("Redis pending requests queue is full"));
+      }
+      return this;
+    }
+
+    if (!connected) {
+      // this avoids entering the socket exception handler as it is well known
+      // that the transport is broken.
+      handler.handle(Future.failedFuture("Redis connection is broken."));
+      return this;
+    }
+
     if (waiting.freeSlots() < commands.size()) {
       handler.handle(Future.failedFuture("Redis waiting Queue is full"));
       return this;
@@ -320,6 +361,7 @@ public class RedisClient implements Redis, ParserHandler {
 
   @Override
   public void handle(Response reply) {
+
     // pub/sub mode
     if (waiting.isEmpty()) {
       if (onMessage != null) {
